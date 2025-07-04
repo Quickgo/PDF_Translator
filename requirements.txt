@@ -1,0 +1,16 @@
+# PDF Translator requirements
+pymupdf
+reportlab
+transformers
+langdetect
+onnxruntime
+deep-translator
+requests
+Pillow
+pytesseract
+tqdm
+optimum
+openvino
+chardet
+beautifulsoup4
+nltk
