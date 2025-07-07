@@ -141,30 +141,49 @@ def detect_language(pages_content, source_lang=None):
     return detect(text_sample)
 
 def translate_texts(texts, src_lang, tgt_lang, device="CPU"):
-    model_name = f"Helsinki-NLP/opus-mt-{src_lang}-{tgt_lang}"
-    translator = None
-    loaded_device = None
+    # --- NEW: Use a higher quality NLLB model ---
+    model_name = "facebook/nllb-200-distilled-600M"
+    
+    # NLLB models use different language codes (BCP 47). We need a map.
+    nllb_lang_map = {
+        "en": "eng_Latn", "fr": "fra_Latn", "es": "spa_Latn",
+        "de": "deu_Latn", "zh": "zho_Hans", "ru": "rus_Cyrl",
+        "ar": "ara_Arab", "pt": "por_Latn", "it": "ita_Latn",
+        "ja": "jpn_Jpan", "ko": "kor_Hang"
+        # Add more mappings as needed from the NLLB paper
+    }
+    src_lang_nllb = nllb_lang_map.get(src_lang)
+    tgt_lang_nllb = nllb_lang_map.get(tgt_lang)
 
-    # Attempt to load the local model, with fallback from specified device to CPU
-    devices_to_try = [d.strip() for d in device.split(',')]
-    if "CPU" not in devices_to_try:
-        devices_to_try.append("CPU")
+    if not src_lang_nllb or not tgt_lang_nllb:
+        print(f"FATAL: Language code '{src_lang}' or '{tgt_lang}' not supported by the NLLB model in this script.")
+        print("Falling back to Google Translate.")
+        translator = None # Force fallback
+    else:
+        translator = None
+        loaded_device = None
 
-    for dev in devices_to_try:
-        try:
-            print(f"Attempting to load model on {dev}...")
-            model = OVModelForSeq2SeqLM.from_pretrained(model_name, export=True, compile=True, device=dev)
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            translator = pipeline("translation", model=model, tokenizer=tokenizer)
-            loaded_device = dev
-            print(f"Successfully loaded model on {dev}.")
-            break  # Success, exit the loop
-        except Exception as e:
-            print(f"Warning: Could not load the model on {dev}. Error: {e}")
-            if dev == devices_to_try[-1]: # If this was the last device to try
-                print("Local model loading failed on all available devices.")
-            else:
-                print("Attempting to fall back to the next device...")
+        # Attempt to load the local model, with fallback from specified device to CPU
+        devices_to_try = [d.strip() for d in device.split(',')]
+        if "CPU" not in devices_to_try:
+            devices_to_try.append("CPU")
+
+        for dev in devices_to_try:
+            try:
+                print(f"Attempting to load model '{model_name}' on {dev}...")
+                model = OVModelForSeq2SeqLM.from_pretrained(model_name, export=True, compile=True, device=dev)
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                # For NLLB, we create the pipeline without languages, and specify them on each call
+                translator = pipeline("translation", model=model, tokenizer=tokenizer)
+                loaded_device = dev
+                print(f"Successfully loaded model on {dev}.")
+                break  # Success, exit the loop
+            except Exception as e:
+                print(f"Warning: Could not load the model on {dev}. Error: {e}")
+                if dev == devices_to_try[-1]: # If this was the last device to try
+                    print("Local model loading failed on all available devices.")
+                else:
+                    print("Attempting to fall back to the next device...")
 
     # If local model loading failed on all devices, fall back to Google Translate
     if translator is None:
@@ -194,10 +213,11 @@ def translate_texts(texts, src_lang, tgt_lang, device="CPU"):
 
     # If local model loaded successfully
     translated_texts = []
-    for text in tqdm(texts, desc=f"Translating with local model on {loaded_device}"):
+    # For NLLB, we need to specify source and target languages for each call
+    for text in tqdm(texts, desc=f"Translating with NLLB model on {loaded_device}"):
         if text.strip():
             try:
-                result = translator(text)
+                result = translator(text, src_lang=src_lang_nllb, tgt_lang=tgt_lang_nllb)
                 translated_texts.append(result[0]['translation_text'])
             except Exception as e:
                 print(f"Warning: Could not translate text: '{text}'. Error: {e}")
@@ -431,8 +451,38 @@ def rebuild_pdf(input_pdf, pages_content, translated_texts, font_buffers, output
         page_rect = src_page.rect
         new_page = new_doc.new_page(width=page_rect.width, height=page_rect.height)
         
+        # --- NEW: Extract and draw vector graphics (lines, rectangles) ---
+        # This helps preserve table layouts and other structural elements.
+        drawings = src_page.get_drawings()
+        for path in drawings:
+            # Properties for the entire path
+            stroke_color = path.get("color") 
+            fill_color = path.get("fill")
+            width = path.get("width", 1)
+            
+            for item in path["items"]:
+                if item[0] == "l":  # Draw a line
+                    # Lines are only stroked, so only draw if there's a stroke color
+                    if stroke_color:
+                        new_page.draw_line(item[1], item[2], color=stroke_color, width=width)
+                elif item[0] == "re":  # Draw a rectangle
+                    # Rectangles can be stroked, filled, or both
+                    if stroke_color or fill_color:
+                        new_page.draw_rect(item[1], color=stroke_color, fill=fill_color, width=width)
+                elif item[0] == "c": # Draw a cubic Bezier curve
+                    if stroke_color:
+                        new_page.draw_bezier(item[1], item[2], item[3], item[4], color=stroke_color, width=width)
+                elif item[0] == "qu": # Draw a quad
+                    # Quads can be stroked, filled, or both
+                    if stroke_color or fill_color:
+                        new_page.draw_quad(item[1], color=stroke_color, fill=fill_color, width=width)
+
         # Keep track of fonts already inserted on this page
         inserted_fonts = set()
+        # --- MASTER FALLBACK FONT ---
+        # Register a guaranteed fallback font once per page to prevent silent failures.
+        # PyMuPDF's built-in fonts don't need registration, so we just need the name.
+        master_fallback_font = "helv"
 
         for item in page_items:
             if not item['text'].strip():
@@ -470,7 +520,8 @@ def rebuild_pdf(input_pdf, pages_content, translated_texts, font_buffers, output
                         new_page.insert_font(fontname=font_alias, fontfile=font_path)
                         inserted_fonts.add(font_alias)
                         font_to_use = font_alias
-                    except Exception: pass
+                    except Exception as e:
+                        print(f"Warning: Could not load local font '{font_path}' as alias '{font_alias}'. Error: {e}")
                 else:
                     font_to_use = font_alias
             
@@ -484,7 +535,8 @@ def rebuild_pdf(input_pdf, pages_content, translated_texts, font_buffers, output
                             new_page.insert_font(fontname=buffer_font_alias, fontbuffer=font_buffer)
                             inserted_fonts.add(buffer_font_alias)
                             font_to_use = buffer_font_alias
-                        except Exception: pass
+                        except Exception as e:
+                            print(f"Warning: Could not load embedded font '{buffer_font_alias}'. Error: {e}")
                     else:
                         font_to_use = buffer_font_alias
 
